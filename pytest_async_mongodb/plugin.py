@@ -1,15 +1,12 @@
+from bson import json_util
 import asyncio
 import os
 import functools
 import json
 import codecs
-import types
-
 import mongomock
-import pytest
 import yaml
-from bson import json_util
-
+import pytest_asyncio
 
 _cache = {}
 
@@ -17,131 +14,188 @@ _cache = {}
 def pytest_addoption(parser):
 
     parser.addini(
-        name='async_mongodb_fixtures',
-        help='Load these fixtures for tests',
-        type='linelist')
+        name="async_mongodb_fixtures",
+        help="Load these fixtures for tests",
+        type="linelist",
+    )
 
     parser.addini(
-        name='async_mongodb_fixture_dir',
-        help='Try loading fixtures from this directory',
-        default=os.getcwd())
+        name="async_mongodb_fixture_dir",
+        help="Try loading fixtures from this directory",
+        default=os.getcwd(),
+    )
 
     parser.addoption(
-        '--async_mongodb-fixture-dir',
-        help='Try loading fixtures from this directory')
+        "--async_mongodb-fixture-dir", help="Try loading fixtures from this directory"
+    )
 
 
-
-def wrapper(func):
-    @functools.wraps(func)
+def async_decorator(func):
     async def wrapped(*args, **kwargs):
-        coro_func = asyncio.coroutine(func)
-        return await coro_func(*args, **kwargs)
+        return func(*args, **kwargs)
+
     return wrapped
 
 
-class AsyncClassMethod(object):
-
-    ASYNC_METHODS = []
-
-    def __getattribute__(self, name):
-        attr = super(AsyncClassMethod, self).__getattribute__(name)
-        if type(attr) == types.MethodType and name in self.ASYNC_METHODS:
-            attr = wrapper(attr)
-        return attr
+def async_wrap(obj):
+    # wrap all the public interfaces except the one has been re-defined in obj
+    for item in dir(obj._base_sync_obj):
+        if not item.startswith("_"):
+            member = getattr(obj._base_sync_obj, item)
+            if callable(member) and item not in dir(obj):
+                setattr(obj, item, async_decorator(member))
 
 
-class AsyncCollection(AsyncClassMethod, mongomock.Collection):
+class AsyncCursor(mongomock.collection.Cursor):
+    def __aiter__(self):
+        return self
 
-    ASYNC_METHODS = [
-        'find_one',
-        'find',
-        'count',
-    ]
-
-    async def find_one(self, filter=None, *args, **kwargs):
-        import collections
-        # Allow calling find_one with a non-dict argument that gets used as
-        # the id for the query.
-        if filter is None:
-            filter = {}
-        if not isinstance(filter, collections.Mapping):
-            filter = {'_id': filter}
-
-        cursor = await self.find(filter, *args, **kwargs)
+    async def __anext__(self):
         try:
-            return next(cursor)
+            return next(self)
         except StopIteration:
-            return None
+            raise StopAsyncIteration()
+
+    async def to_list(self, length=None):
+        the_list = []
+        try:
+            while length is None or len(the_list) < length:
+                the_list.append(next(self))
+        finally:
+            return the_list
 
 
-class AsyncDatabase(AsyncClassMethod, mongomock.Database):
+class AsyncCommandCursor(mongomock.command_cursor.CommandCursor):
+    def __aiter__(self):
+        return self
 
-    ASYNC_METHODS = [
-        'collection_names'
-    ]
+    async def __anext__(self):
+        try:
+            return next(self)
+        except StopIteration:
+            raise StopAsyncIteration()
 
-    def get_collection(self, name, codec_options=None, read_preference=None,
-                       write_concern=None):
-        collection = self._collections.get(name)
-        if collection is None:
-            collection = self._collections[name] = AsyncCollection(self, name)
-        return collection
-
-
-class AsyncMockMongoClient(mongomock.MongoClient):
-
-    def get_database(self, name, codec_options=None, read_preference=None,
-                     write_concern=None):
-        db = self._databases.get(name)
-        if db is None:
-            db = self._databases[name] = AsyncDatabase(self, name)
-        return db
+    async def to_list(self, length=None):
+        the_list = []
+        try:
+            while length is None or len(the_list) < length:
+                the_list.append(next(self))
+        finally:
+            return the_list
 
 
-@pytest.fixture(scope='function')
-async def async_mongodb(pytestconfig):
-    client = AsyncMockMongoClient()
-    db = client['pytest']
+class AsyncCollection:
+    def __init__(self, mongomock_collection):
+        self._base_sync_obj = mongomock_collection
+        async_wrap(self)
+
+    def find(self, *args, **kwargs) -> AsyncCursor:
+        cursor = self._base_sync_obj.find(*args, **kwargs)
+        cursor.__class__ = AsyncCursor
+        return cursor
+
+    def aggregate(self, *args, **kwargs) -> AsyncCommandCursor:
+        cursor = self._base_sync_obj.aggregate(*args, **kwargs)
+        cursor.__class__ = AsyncCommandCursor
+        return cursor
+
+
+class AsyncDatabase:
+    def __init__(self, mongomock_db):
+        self._base_sync_obj = mongomock_db
+        async_wrap(self)
+
+    def __getattr__(self, attr):
+        return self[attr]
+
+    def __getitem__(self, db_name):
+        return self.get_collection(db_name)
+
+    def get_collection(self, *args, **kwargs) -> AsyncCollection:
+        collection = self._base_sync_obj.get_collection(*args, **kwargs)
+        return AsyncCollection(collection)
+
+
+class Session:
+    async def __aenter__(self):
+        await asyncio.sleep(0)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await asyncio.sleep(0)
+
+
+class AsyncMockMongoClient:
+    def __init__(self, mongomock_client):
+        self._base_sync_obj = mongomock_client
+        async_wrap(self)
+
+    def __getattr__(self, attr):
+        return self[attr]
+
+    def __getitem__(self, db_name):
+        return self.get_database(db_name)
+
+    def get_database(self, *args, **kwargs) -> AsyncDatabase:
+        db = self._base_sync_obj.get_database(*args, **kwargs)
+        return AsyncDatabase(db)
+
+    async def start_session(self, **kwargs):
+        await asyncio.sleep(0)
+        return Session()
+
+
+@pytest_asyncio.fixture(scope="function")
+async def async_mongodb(event_loop, pytestconfig):
+    client = AsyncMockMongoClient(mongomock.MongoClient())
+    db = client["pytest"]
     await clean_database(db)
-    load_fixtures(db, pytestconfig)
+    await load_fixtures(db, pytestconfig)
     return db
 
 
+@pytest_asyncio.fixture(scope="function")
+async def async_mongodb_client(event_loop, pytestconfig):
+    client = AsyncMockMongoClient(mongomock.MongoClient())
+    db = client["pytest"]
+    await clean_database(db)
+    await load_fixtures(db, pytestconfig)
+    return client
+
+
 async def clean_database(db):
-    collections = await db.collection_names(include_system_collections=False)
+    collections = await db.list_collection_names()
     for name in collections:
-        db.drop_collection(name)
+        await db.drop_collection(name)
 
 
-def load_fixtures(db, config):
-    option_dir = config.getoption('async_mongodb_fixture_dir')
-    ini_dir = config.getini('async_mongodb_fixture_dir')
-    fixtures = config.getini('async_mongodb_fixtures')
+async def load_fixtures(db, config):
+    option_dir = config.getoption("async_mongodb_fixture_dir")
+    ini_dir = config.getini("async_mongodb_fixture_dir")
+    fixtures = config.getini("async_mongodb_fixtures")
     basedir = option_dir or ini_dir
 
     for file_name in os.listdir(basedir):
         collection, ext = os.path.splitext(os.path.basename(file_name))
-        file_format = ext.strip('.')
-        supported = file_format in ('json', 'yaml')
+        file_format = ext.strip(".")
+        supported = file_format in ("json", "yaml")
         selected = fixtures and collection in fixtures
         if selected and supported:
             path = os.path.join(basedir, file_name)
-            load_fixture(db, collection, path, file_format)
+            await load_fixture(db, collection, path, file_format)
 
 
-def load_fixture(db, collection, path, file_format):
-    if file_format == 'json':
+async def load_fixture(db, collection, path, file_format):
+    if file_format == "json":
         loader = functools.partial(json.load, object_hook=json_util.object_hook)
-    elif file_format == 'yaml':
-        loader = yaml.load
+    elif file_format == "yaml":
+        loader = functools.partial(yaml.load, Loader=yaml.FullLoader)
     else:
         return
     try:
         docs = _cache[path]
     except KeyError:
-        with codecs.open(path, encoding='utf-8') as fp:
+        with codecs.open(path, encoding="utf-8") as fp:
             _cache[path] = docs = loader(fp)
 
     for document in docs:
-        db[collection].insert(document)
+        await db[collection].insert_one(document)
