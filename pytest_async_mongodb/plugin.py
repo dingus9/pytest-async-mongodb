@@ -182,7 +182,8 @@ async def load_fixtures(db, config):
         if selected and supported:
             path = os.path.join(basedir, file_name)
             await load_fixture(db, collection, path, file_format)
-
+        else:
+            raise Exception(f"No collections found in {basedir} with .json or .yaml")
 
 async def load_fixture(db, collection, path, file_format):
     if file_format == "json":
